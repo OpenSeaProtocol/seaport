@@ -75,6 +75,7 @@ uint256 constant Execution_offerer_offset = 0x20;
 uint256 constant Execution_conduit_offset = 0x40;
 
 uint256 constant Panic_arithmetic = 0x11;
+uint256 constant Panic_resource = 0x41;
 
 uint256 constant OrderParameters_offer_head_offset = 0x40;
 uint256 constant OrderParameters_consideration_head_offset = 0x60;

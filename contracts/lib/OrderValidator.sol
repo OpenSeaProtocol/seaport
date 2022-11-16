@@ -309,6 +309,73 @@ contract OrderValidator is Executor, ZoneInteraction {
         return (orderHash, numerator, denominator);
     }
 
+    function _decodeContractOrderReturnData()
+        internal
+        pure
+        returns (SpentItem[] memory offer, ReceivedItem[] memory consideration)
+    {
+        assembly {
+            returndatacopy(0, 0, 0x40)
+            let offsetOffer := mload(0)
+            let offsetConsideration := mload(0x20)
+
+            returndatacopy(0, offsetOffer, 0x20)
+            let offerLength := mload(0)
+            returndatacopy(0x20, offsetConsideration, 0x20)
+            let considerationLength := mload(0x20)
+
+            let totalOfferSize := mul(0x80, offerLength)
+            let totalConsiderationSize := mul(0xa0, considerationLength)
+            let totalSize := add(
+                0x80,
+                add(totalOfferSize, totalConsiderationSize)
+            )
+            if or(
+                gt(or(offerLength, considerationLength), 0xffff),
+                xor(totalSize, returndatasize())
+            ) {
+                mstore(0, Panic_error_selector)
+                mstore(Panic_error_code_ptr, Panic_resource)
+                revert(0, Panic_error_length)
+            }
+
+            offer := mload(0x40)
+            let mPtrTailOffer := writeArrayPointers(offer, offerLength, 0x80)
+            returndatacopy(mPtrTailOffer, add(offsetOffer, 32), totalOfferSize)
+            consideration := add(mPtrTailOffer, totalOfferSize)
+            let mPtrTailConsideration := writeArrayPointers(
+                consideration,
+                considerationLength,
+                0xa0
+            )
+            returndatacopy(
+                mPtrTailConsideration,
+                add(offsetConsideration, 32),
+                totalConsiderationSize
+            )
+            mstore(0x40, add(mPtrTailConsideration, totalConsiderationSize))
+
+            function writeArrayPointers(mPtrLength, length, memoryStride)
+                -> mPtrTail
+            {
+                mstore(mPtrLength, length)
+                let mPtrHead := add(mPtrLength, 0x20)
+                let headSize := mul(length, 0x20)
+                mPtrTail := add(mPtrHead, headSize)
+                let mPtrTailNext := mPtrTail
+                for {
+
+                } lt(mPtrHead, mPtrTail) {
+
+                } {
+                    mstore(mPtrHead, mPtrTailNext)
+                    mPtrHead := add(mPtrHead, 0x20)
+                    mPtrTailNext := add(mPtrTailNext, memoryStride)
+                }
+            }
+        }
+    }
+
     function _getGeneratedOrder(
         OrderParameters memory orderParameters,
         bytes memory context,
@@ -321,41 +388,100 @@ contract OrderValidator is Executor, ZoneInteraction {
             uint256 denominator
         )
     {
-        SpentItem[] memory offer;
-        ReceivedItem[] memory consideration;
+        bytes4 selector = ContractOffererInterface.generateOrder.selector;
+        address offerer = orderParameters.offerer;
+        bool success;
+        assembly {
+            let cdPtr := mload(0x40)
+            mstore(cdPtr, selector)
 
-        {
-            // TODO: reuse existing memory region or relocate this functionality
-            (
-                SpentItem[] memory originalOfferItems,
-                SpentItem[] memory originalConsiderationItems
-            ) = _convertToSpent(
-                    orderParameters.offer,
-                    orderParameters.consideration
-                );
+            // Get the pointer to the offers array.
+            let offerArrPtr := mload(
+                add(orderParameters, OrderParameters_offer_head_offset)
+            )
+            let considerationArrPtr := mload(
+                add(orderParameters, OrderParameters_consideration_head_offset)
+            )
 
-            try
-                ContractOffererInterface(orderParameters.offerer).generateOrder(
-                    originalOfferItems,
-                    originalConsiderationItems,
-                    context
-                )
-            returns (
-                SpentItem[] memory returnedOffer,
-                ReceivedItem[] memory ReturnedConsideration
-            ) {
-                offer = returnedOffer;
-                consideration = ReturnedConsideration;
-            } catch (bytes memory revertData) {
-                if (!revertOnInvalid) {
-                    return (bytes32(0), 0, 0);
+            let cdPtrHead := add(cdPtr, 4)
+            let tailOffset := 0x60
+            mstore(cdPtrHead, tailOffset)
+            tailOffset := add(
+                tailOffset,
+                copySpentItemArray(offerArrPtr, add(cdPtrHead, tailOffset))
+            )
+            mstore(add(cdPtrHead, 0x20), tailOffset)
+            tailOffset := add(
+                tailOffset,
+                copySpentItemArray(considerationArrPtr, add(cdPtrHead, tailOffset))
+            )
+            mstore(add(cdPtrHead, 0x40), tailOffset)
+            tailOffset := add(
+                tailOffset,
+                copyBytes(context, add(cdPtrHead, tailOffset))
+            )
+
+            success := call(gas(), offerer, 0, cdPtr, add(4, tailOffset), 0, 0)
+
+            function copySpentItemArray(mPtrLength, cdPtrLength) -> size {
+                let length := mload(mPtrLength)
+                mstore(cdPtrLength, length)
+
+                let mPtrHead := add(mPtrLength, 0x20)
+                let cdpos := add(cdPtrLength, 0x20)
+                let mstop := add(mPtrHead, mul(length, 0x20))
+
+                for {
+
+                } lt(mPtrHead, mstop) {
+
+                } {
+                    let mpos := mload(mPtrHead)
+                    mstore(cdpos, mload(mpos))
+                    mstore(add(cdpos, 0x20), mload(add(mpos, 0x20)))
+                    mstore(add(cdpos, 0x40), mload(add(mpos, 0x40)))
+                    mstore(add(cdpos, 0x60), mload(add(mpos, 0x60)))
+                    mPtrHead := add(mPtrHead, 0x20)
+                    cdpos := add(cdpos, 0x80)
                 }
+                size := add(0x20, mul(length, 0x80))
+            }
 
-                assembly {
-                    revert(add(0x20, revertData), mload(revertData))
+            function copyBytes(mPtrLength, cdPtrLength) -> size {
+                let length := mload(mPtrLength)
+                mstore(cdPtrLength, length)
+
+                size := and(add(length, 63), 0xffffe0)
+
+                let mpos := add(mPtrLength, 0x20)
+                let cdpos := add(cdPtrLength, 0x20)
+                let mstop := add(mPtrLength, size)
+
+                for {
+
+                } lt(mpos, mstop) {
+
+                } {
+                    mstore(cdpos, mload(mpos))
+                    mpos := add(mpos, 32)
+                    cdpos := add(cdpos, 0x20)
                 }
             }
         }
+        if (!success) {
+            if (!revertOnInvalid) {
+                return (bytes32(0), 0, 0);
+            }
+
+            assembly {
+                returndatacopy(0, 0, returndatasize())
+                revert(0, returndatasize())
+            }
+        }
+        (
+            SpentItem[] memory offer,
+            ReceivedItem[] memory consideration
+        ) = _decodeContractOrderReturnData();
 
         uint256 errorBuffer = 0;
 
@@ -500,7 +626,7 @@ contract OrderValidator is Executor, ZoneInteraction {
             return _revertOrReturnEmpty(revertOnInvalid);
         }
 
-        address offerer = orderParameters.offerer;
+        // address offerer = orderParameters.offerer;
         uint256 contractNonce = _contractNonces[offerer]++;
         assembly {
             orderHash := or(contractNonce, shl(0x60, offerer))
@@ -579,53 +705,85 @@ contract OrderValidator is Executor, ZoneInteraction {
      */
     function _convertToSpent(
         OfferItem[] memory offer,
-        ConsiderationItem[] memory consideration
+        ConsiderationItem[] memory consideration,
+        bytes memory context
     )
         internal
         pure
-        returns (
-            SpentItem[] memory spentItems,
-            SpentItem[] memory receivedItems
-        )
+        returns (bytes memory cdata)
+    /*             SpentItem[] memory spentItems,
+            SpentItem[] memory receivedItems */
     {
-        // Create an array of spent items equal to the offer length.
-        spentItems = new SpentItem[](offer.length);
+        bytes4 selector = ContractOffererInterface.generateOrder.selector;
+        assembly {
+            cdata := mload(0x40)
+            let cdPtr := add(cdata, 0x20)
+            mstore(cdPtr, selector)
 
-        // Iterate over each offer item on the order.
-        for (uint256 i = 0; i < offer.length; ++i) {
-            // Retrieve the offer item.
-            OfferItem memory offerItem = offer[i];
+            let cdPtrHead := add(cdPtr, 4)
+            let tailOffset := 0x60
+            mstore(cdPtrHead, tailOffset)
+            tailOffset := add(
+                tailOffset,
+                copySpentItemArray(offer, add(cdPtrHead, tailOffset))
+            )
+            mstore(add(cdPtrHead, 0x20), tailOffset)
+            tailOffset := add(
+                tailOffset,
+                copySpentItemArray(consideration, add(cdPtrHead, tailOffset))
+            )
+            mstore(add(cdPtrHead, 0x40), tailOffset)
+            tailOffset := add(
+                tailOffset,
+                copyBytes(context, add(cdPtrHead, tailOffset))
+            )
 
-            // Create spent item for event based on the offer item.
-            SpentItem memory spentItem = SpentItem(
-                offerItem.itemType,
-                offerItem.token,
-                offerItem.identifierOrCriteria,
-                offerItem.startAmount
-            );
+            mstore(cdata, add(4, tailOffset))
 
-            // Add to array of spent items
-            spentItems[i] = spentItem;
-        }
+            function copySpentItemArray(mPtrLength, cdPtrLength) -> size {
+                let length := mload(mPtrLength)
+                mstore(cdPtrLength, length)
 
-        // Create an array of received items equal to the consideration length.
-        receivedItems = new SpentItem[](consideration.length);
+                let mPtrHead := add(mPtrLength, 0x20)
+                let cdpos := add(cdPtrLength, 0x20)
+                let mstop := add(mPtrHead, mul(length, 0x20))
 
-        // Iterate over each consideration item on the order.
-        for (uint256 i = 0; i < consideration.length; ++i) {
-            // Retrieve the consideration item.
-            ConsiderationItem memory considerationItem = (consideration[i]);
+                for {
 
-            // Create spent item for event based on the consideration item.
-            SpentItem memory receivedItem = SpentItem(
-                considerationItem.itemType,
-                considerationItem.token,
-                considerationItem.identifierOrCriteria,
-                considerationItem.startAmount
-            );
+                } lt(mPtrHead, mstop) {
 
-            // Add to array of received items
-            receivedItems[i] = receivedItem;
+                } {
+                    let mpos := mload(mPtrHead)
+                    mstore(cdpos, mload(mpos))
+                    mstore(add(cdpos, 0x20), mload(add(mpos, 0x20)))
+                    mstore(add(cdpos, 0x40), mload(add(mpos, 0x40)))
+                    mstore(add(cdpos, 0x60), mload(add(mpos, 0x60)))
+                    mPtrHead := add(mPtrHead, 0x20)
+                    cdpos := add(cdpos, 0x80)
+                }
+                size := add(0x20, mul(length, 0x80))
+            }
+
+            function copyBytes(mPtrLength, cdPtrLength) -> size {
+                let length := mload(mPtrLength)
+                mstore(cdPtrLength, length)
+
+                size := and(add(length, 63), 0xffffe0)
+
+                let mpos := add(mPtrLength, 0x20)
+                let cdpos := add(cdPtrLength, 0x20)
+                let mstop := add(mPtrLength, size)
+
+                for {
+
+                } lt(mpos, mstop) {
+
+                } {
+                    mstore(cdpos, mload(mpos))
+                    mpos := add(mpos, 32)
+                    cdpos := add(cdpos, 0x20)
+                }
+            }
         }
     }
 
