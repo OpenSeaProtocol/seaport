@@ -315,21 +315,31 @@ contract OrderValidator is Executor, ZoneInteraction {
         returns (SpentItem[] memory offer, ReceivedItem[] memory consideration)
     {
         assembly {
-            returndatacopy(0, 0, 0x40)
+            // First two words of calldata are the offsets to offer and consideration
+            // array lengths. Copy these to scratch space.
+            returndatacopy(0, 0, TwoWords)
             let offsetOffer := mload(0)
             let offsetConsideration := mload(0x20)
 
+            // Copy length of offer array to scratch space
             returndatacopy(0, offsetOffer, 0x20)
             let offerLength := mload(0)
+            // Copy length of consideration array to scratch space
             returndatacopy(0x20, offsetConsideration, 0x20)
             let considerationLength := mload(0x20)
 
-            let totalOfferSize := mul(0x80, offerLength)
-            let totalConsiderationSize := mul(0xa0, considerationLength)
+            // Calculate total size of offer and consideration arrays
+            let totalOfferSize := mul(SpentItem_size, offerLength)
+            let totalConsiderationSize := mul(ReceivedItem_size, considerationLength)
+
+            // Add 4 words to total size to cover the offset and length fields of
+            // the two arrays
             let totalSize := add(
-                0x80,
+                FourWords,
                 add(totalOfferSize, totalConsiderationSize)
             )
+            // Revert if returndatasize exceeds 65535 bytes or returndatasize
+            // is not equal to the calculated size.
             if or(
                 gt(or(offerLength, considerationLength), 0xffff),
                 xor(totalSize, returndatasize())
@@ -353,7 +363,7 @@ contract OrderValidator is Executor, ZoneInteraction {
                 add(offsetConsideration, 32),
                 totalConsiderationSize
             )
-            mstore(0x40, add(mPtrTailConsideration, totalConsiderationSize))
+            mstore(FreeMemoryPointerSlot, add(mPtrTailConsideration, totalConsiderationSize))
 
             function writeArrayPointers(mPtrLength, length, memoryStride)
                 -> mPtrTail
@@ -413,7 +423,10 @@ contract OrderValidator is Executor, ZoneInteraction {
             mstore(add(cdPtrHead, 0x20), tailOffset)
             tailOffset := add(
                 tailOffset,
-                copySpentItemArray(considerationArrPtr, add(cdPtrHead, tailOffset))
+                copySpentItemArray(
+                    considerationArrPtr,
+                    add(cdPtrHead, tailOffset)
+                )
             )
             mstore(add(cdPtrHead, 0x40), tailOffset)
             tailOffset := add(
@@ -423,48 +436,74 @@ contract OrderValidator is Executor, ZoneInteraction {
 
             success := call(gas(), offerer, 0, cdPtr, add(4, tailOffset), 0, 0)
 
+            // Function to copy the itemType, token, identifier and amount from each
+            // item in the offer or consideration arrays. Reused to minimize code duplication.
             function copySpentItemArray(mPtrLength, cdPtrLength) -> size {
                 let length := mload(mPtrLength)
                 mstore(cdPtrLength, length)
 
+                // Get pointer to first item's head position in the array, containing
+                // the item's pointer in memory. The head pointer will be incremented
+                // until it reaches the tail position (start of the array data).
                 let mPtrHead := add(mPtrLength, 0x20)
-                let cdpos := add(cdPtrLength, 0x20)
-                let mstop := add(mPtrHead, mul(length, 0x20))
+                // Position in memory to write next item for calldata. Since SpentItem
+                // has a fixed length, the array elements do not contain head elements in
+                // calldata, they are concatenated together after the array length.
+                let cdPtrData := add(cdPtrLength, 0x20)
+                // Pointer to end of array head in memory.
+                let mPtrHeadEnd := add(mPtrHead, mul(length, 0x20))
 
                 for {
 
-                } lt(mPtrHead, mstop) {
+                } lt(mPtrHead, mPtrHeadEnd) {
 
                 } {
-                    let mpos := mload(mPtrHead)
-                    mstore(cdpos, mload(mpos))
-                    mstore(add(cdpos, 0x20), mload(add(mpos, 0x20)))
-                    mstore(add(cdpos, 0x40), mload(add(mpos, 0x40)))
-                    mstore(add(cdpos, 0x60), mload(add(mpos, 0x60)))
+                    // Read pointer to data for the array element from its head position
+                    let mPtrTail := mload(mPtrHead)
+                    // Copy the itemType, token, identifier, amount from the item to calldata
+                    mstore(cdPtrData, mload(mPtrTail))
+                    mstore(
+                        add(cdPtrData, Common_token_offset),
+                        mload(add(mPtrTail, Common_token_offset))
+                    )
+                    mstore(
+                        add(cdPtrData, Common_identifier_offset),
+                        mload(add(mPtrTail, Common_identifier_offset))
+                    )
+                    mstore(
+                        add(cdPtrData, Common_amount_offset),
+                        mload(add(mPtrTail, Common_amount_offset))
+                    )
+
                     mPtrHead := add(mPtrHead, 0x20)
-                    cdpos := add(cdpos, 0x80)
+                    cdPtrData := add(cdPtrData, SpentItem_size)
                 }
-                size := add(0x20, mul(length, 0x80))
+                size := add(0x20, mul(length, SpentItem_size))
             }
 
+            // Function to copy a `bytes` value from `mPtrLength` to `cdPtrLength`.
             function copyBytes(mPtrLength, cdPtrLength) -> size {
                 let length := mload(mPtrLength)
                 mstore(cdPtrLength, length)
 
+                // Rounds the byte length up to the nearest multiple of 32 and adds one word
+                // for the length.
                 size := and(add(length, 63), 0xffffe0)
 
-                let mpos := add(mPtrLength, 0x20)
-                let cdpos := add(cdPtrLength, 0x20)
-                let mstop := add(mPtrLength, size)
+                // Get pointer to start of data
+                let mPtrData := add(mPtrLength, 0x20)
+                let cdPtrData := add(cdPtrLength, 0x20)
+                let mPtrDataEnd := add(mPtrLength, size)
 
+                // Copies one word at a time
                 for {
 
-                } lt(mpos, mstop) {
+                } lt(mPtrData, mPtrDataEnd) {
 
                 } {
-                    mstore(cdpos, mload(mpos))
-                    mpos := add(mpos, 32)
-                    cdpos := add(cdpos, 0x20)
+                    mstore(cdPtrData, mload(mPtrData))
+                    mPtrData := add(mPtrData, 0x20)
+                    cdPtrData := add(cdPtrData, 0x20)
                 }
             }
         }
@@ -707,21 +746,16 @@ contract OrderValidator is Executor, ZoneInteraction {
         OfferItem[] memory offer,
         ConsiderationItem[] memory consideration,
         bytes memory context
-    )
-        internal
-        pure
-        returns (bytes memory cdata)
-    /*             SpentItem[] memory spentItems,
-            SpentItem[] memory receivedItems */
-    {
+    ) internal pure returns (bytes memory cdata) {
         bytes4 selector = ContractOffererInterface.generateOrder.selector;
         assembly {
-            cdata := mload(0x40)
+            // Get free memory pointer to use for calldata to contract offerer
+            cdata := mload(FreeMemoryPointerSlot)
             let cdPtr := add(cdata, 0x20)
+            // Write function selector to memory
             mstore(cdPtr, selector)
-
             let cdPtrHead := add(cdPtr, 4)
-            let tailOffset := 0x60
+            let tailOffset := GenerateOrder_tail_offset
             mstore(cdPtrHead, tailOffset)
             tailOffset := add(
                 tailOffset,
@@ -740,48 +774,74 @@ contract OrderValidator is Executor, ZoneInteraction {
 
             mstore(cdata, add(4, tailOffset))
 
+            // Function to copy the itemType, token, identifier and amount from each
+            // item in the offer or consideration arrays. Reused to minimize code duplication.
             function copySpentItemArray(mPtrLength, cdPtrLength) -> size {
                 let length := mload(mPtrLength)
                 mstore(cdPtrLength, length)
 
+                // Get pointer to first item's head position in the array, containing
+                // the item's pointer in memory. The head pointer will be incremented
+                // until it reaches the tail position (start of the array data).
                 let mPtrHead := add(mPtrLength, 0x20)
-                let cdpos := add(cdPtrLength, 0x20)
-                let mstop := add(mPtrHead, mul(length, 0x20))
+                // Position in memory to write next item for calldata. Since SpentItem
+                // has a fixed length, the array elements do not contain head elements in
+                // calldata, they are concatenated together after the array length.
+                let cdPtrData := add(cdPtrLength, 0x20)
+                // Pointer to end of array head in memory.
+                let mPtrHeadEnd := add(mPtrHead, mul(length, 0x20))
 
                 for {
 
-                } lt(mPtrHead, mstop) {
+                } lt(mPtrHead, mPtrHeadEnd) {
 
                 } {
-                    let mpos := mload(mPtrHead)
-                    mstore(cdpos, mload(mpos))
-                    mstore(add(cdpos, 0x20), mload(add(mpos, 0x20)))
-                    mstore(add(cdpos, 0x40), mload(add(mpos, 0x40)))
-                    mstore(add(cdpos, 0x60), mload(add(mpos, 0x60)))
+                    // Read pointer to data for the array element from its head position
+                    let mPtrTail := mload(mPtrHead)
+                    // Copy the itemType, token, identifier, amount from the item to calldata
+                    mstore(cdPtrData, mload(mPtrTail))
+                    mstore(
+                        add(cdPtrData, Common_token_offset),
+                        mload(add(mPtrTail, Common_token_offset))
+                    )
+                    mstore(
+                        add(cdPtrData, Common_identifier_offset),
+                        mload(add(mPtrTail, Common_identifier_offset))
+                    )
+                    mstore(
+                        add(cdPtrData, Common_amount_offset),
+                        mload(add(mPtrTail, Common_amount_offset))
+                    )
+
                     mPtrHead := add(mPtrHead, 0x20)
-                    cdpos := add(cdpos, 0x80)
+                    cdPtrData := add(cdPtrData, SpentItem_size)
                 }
-                size := add(0x20, mul(length, 0x80))
+                size := add(0x20, mul(length, SpentItem_size))
             }
 
+            // Function to copy a `bytes` value from `mPtrLength` to `cdPtrLength`.
             function copyBytes(mPtrLength, cdPtrLength) -> size {
                 let length := mload(mPtrLength)
                 mstore(cdPtrLength, length)
 
+                // Rounds the byte length up to the nearest multiple of 32 and adds one word
+                // for the length.
                 size := and(add(length, 63), 0xffffe0)
 
-                let mpos := add(mPtrLength, 0x20)
-                let cdpos := add(cdPtrLength, 0x20)
-                let mstop := add(mPtrLength, size)
+                // Get pointer to start of data
+                let mPtrData := add(mPtrLength, 0x20)
+                let cdPtrData := add(cdPtrLength, 0x20)
+                let mPtrDataEnd := add(mPtrLength, size)
 
+                // Copies one word at a time
                 for {
 
-                } lt(mpos, mstop) {
+                } lt(mPtrData, mPtrDataEnd) {
 
                 } {
-                    mstore(cdpos, mload(mpos))
-                    mpos := add(mpos, 32)
-                    cdpos := add(cdpos, 0x20)
+                    mstore(cdPtrData, mload(mPtrData))
+                    mPtrData := add(mPtrData, 0x20)
+                    cdPtrData := add(cdPtrData, 0x20)
                 }
             }
         }

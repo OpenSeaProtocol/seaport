@@ -65,6 +65,8 @@ uint256 constant ReceivedItem_size = 0xa0;
 uint256 constant ReceivedItem_amount_offset = 0x60;
 uint256 constant ReceivedItem_recipient_offset = 0x80;
 
+uint256 constant SpentItem_size = 0x80;
+
 uint256 constant ReceivedItem_CommonParams_size = 0x60;
 
 uint256 constant ConsiderationItem_recipient_offset = 0xa0;
@@ -832,3 +834,6 @@ uint256 constant InvalidNativeOfferItem_error_length = 0x04;
 uint256 constant Panic_error_selector = 0x4e487b71;
 uint256 constant Panic_error_code_ptr = 0x20;
 uint256 constant Panic_error_length = 0x24;
+
+
+uint256 constant GenerateOrder_tail_offset = 0x60;
